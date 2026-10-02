@@ -57,6 +57,14 @@ agentic_rag/
 
 ### Running the Application
 
+Interface Streamlit :
+
+```bash
+streamlit run streamlit_app.py
+```
+
+API FastAPI (interface statique) :
+
 ```bash
 python main.py
 ```

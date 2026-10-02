@@ -1,70 +1,92 @@
+from io import BytesIO
+
+from dotenv import load_dotenv
 from langchain.agents import create_agent
-from langchain_openai import ChatOpenAI
-from dotenv.ipython import load_dotenv
-from langchain_community.vectorstores import Chroma
 from langchain.tools import tool
-from langchain.messages import HumanMessage
-from langchain_openai.embeddings import OpenAIEmbeddings
+from langchain_community.vectorstores import Chroma
 from langchain_core.tools import create_retriever_tool
-
-
+from langchain_openai import ChatOpenAI
+from langchain_openai.embeddings import OpenAIEmbeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from pypdf import PdfReader
 
 load_dotenv(override=True)
 
+PDF_SYSTEM_PROMPT = """Tu es un assistant RAG. Tu réponds UNIQUEMENT à partir des PDF déposés.
 
-chunks = [
-"Mon nom est Mohamed Youssfi, Je suis Professeur en Informatique et Intelligence artificielle",
-"Je travaille à l'ENSET Mohammedia, Université Hassan II deCasablanca",
-"J'ai obtenu mon doctorat d'état en 2015, Mon doctorat de troisième cycle en 1996 et mon diplôme de professeur second cycle en 1993",
-"En plus de l'informatique, je suis patiené par la musique et la culture",
-"J'aime aussi écrire des récits sur ma vie et j'aime la philosophie",
-"Je suis originaire de Ouarzazate, une ville au sud du Maroc",
-"après les études de primaire et le collège à Ouarzazate, j'ai suivi mes études de lycée technique à Marrakech",
-"Après le baccalauréat, j'ai rejoint l'ENSET Mohammedia pendant 4 années d'études pour devenir Professeur de second cycle",
-"J'ai travaillé à l'ENSET depuis 1993 pour y enseigner principalement l'informatique et les sciences de l''ingénieur",
-"En parallèle à mon travailler de professeur, j'ai suivi mes études supérieures à la Facultés des sciences de rabat",
-"où j'ai obtenu mon DEA, Doctorat de troisième cycle puis Doctorat d'Etat dans le domaine des systèmes informatiques parallèles et distribués"
-]
+Règles :
+- Appelle TOUJOURS un outil avant de répondre. Ne pose pas de question de clarification à la place d'un appel d'outil.
+- Pour un résumé, une vue d'ensemble, "de quoi parle ce PDF", les points clés : utilise get_uploaded_pdf_content.
+- Pour une question précise : utilise pdf_search avec une requête en mots-clés.
+- N'utilise pas tes connaissances générales ni d'autres documents.
+- Si l'outil ne contient pas l'information, réponds : "Cette information n'apparaît pas dans le(s) PDF déposé(s)."
+- Cite le nom du fichier quand c'est possible.
+- Après l'outil, rédige une réponse utile et complète.
+"""
 
 embedding_model = OpenAIEmbeddings()
-
-vectorstore = Chroma.from_texts(
-    texts=chunks,
-    collection_name="cv_tool",
-    embedding=embedding_model
-    )
-retriever = vectorstore.as_retriever()
+vectorstore = Chroma(
+    collection_name="uploaded_pdfs",
+    embedding_function=embedding_model,
+)
+retriever = vectorstore.as_retriever(search_kwargs={"k": 8})
 retriever_tool = create_retriever_tool(
     retriever=retriever,
-    name="cv_tool",
-    description="Get information about Mohamed's CV"
-
+    name="pdf_search",
+    description="Search uploaded PDFs for a specific topic or keyword.",
 )
 
 
 @tool
-def get_employee_info(name:str):
-    """
-     Get information about an  given employee (name, salary, seniority)
-     """
-    print("get_employee_info tool invoked ")
-    return{"name": name, "salary":12000, "seniority":5}
+def get_uploaded_pdf_content() -> str:
+    """Return the full indexed text of uploaded PDFs. Use for summaries and overview questions."""
+    try:
+        data = vectorstore.get()
+    except Exception as exc:
+        return f"Aucun PDF indexé ({exc})."
+    documents = data.get("documents") or []
+    metadatas = data.get("metadatas") or []
+    if not documents:
+        return "Aucun PDF n'est indexé."
+    parts = []
+    for text, meta in zip(documents, metadatas or [{}] * len(documents)):
+        source = (meta or {}).get("source", "PDF")
+        parts.append(f"[{source}]\n{text}")
+    return "\n\n".join(parts)[:20000]
 
-@tool
-def send_email(email:str, subject:str, content:str):
-    """
-    Send an email  with a subject and content.
-    """
-    print(f"Sending email to{email},subject:{subject},content:{content}")
-    return "Email sent successfully sent to {email}, subject {subject}, content {content}"
 
 llm = ChatOpenAI(model="gpt-4o", temperature=0)
 agent = create_agent(
     model=llm,
-    tools=[get_employee_info, send_email, retriever_tool],
-    system_prompt="Answer to user query using provided tools"
+    tools=[retriever_tool, get_uploaded_pdf_content],
+    system_prompt=PDF_SYSTEM_PROMPT,
 )
 
-#resp = agent.invoke(input={"messages": [HumanMessage("Quel est le salaire de Yassine ?")]})
-#print(resp['messages'][-1].content)
 
+def clear_documents() -> None:
+    try:
+        data = vectorstore.get()
+    except Exception:
+        return
+    ids = data.get("ids") or []
+    if ids:
+        vectorstore.delete(ids=ids)
+
+
+def ingest_pdf(file_bytes: bytes, filename: str) -> int:
+    reader = PdfReader(BytesIO(file_bytes))
+    pages = []
+    for index, page in enumerate(reader.pages, start=1):
+        text = (page.extract_text() or "").strip()
+        if text:
+            pages.append(f"[{filename} p.{index}]\n{text}")
+    if not pages:
+        raise ValueError(f"Aucun texte extractible dans {filename}.")
+
+    splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=120)
+    pieces = splitter.split_text("\n\n".join(pages))
+    vectorstore.add_texts(
+        texts=pieces,
+        metadatas=[{"source": filename} for _ in pieces],
+    )
+    return len(pieces)
