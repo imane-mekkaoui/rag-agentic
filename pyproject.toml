@@ -1,7 +1,7 @@
 [project]
 name = "agentic-rag"
 version = "0.1.0"
-description = "Add your description here"
+description = "Assistant RAG Streamlit : questions uniquement à partir des PDF déposés."
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
